@@ -15,6 +15,8 @@ import {
 
 import { KokoroTTS, TextSplitterStream } from "kokoro-js";
 
+import { PERSONA } from "./persona";
+
 import {
   MAX_BUFFER_DURATION,
   INPUT_SAMPLE_RATE,
@@ -26,11 +28,17 @@ import {
   MIN_SPEECH_DURATION_SAMPLES,
 } from "./constants";
 
+// Forward model download progress to the UI (per-file loaded/total bytes)
+const progress_callback = (data) => {
+  self.postMessage({ type: "loading", data });
+};
+
 const model_id = "onnx-community/Kokoro-82M-v1.0-ONNX";
-let voice;
+let voice = PERSONA.voice;
 const tts = await KokoroTTS.from_pretrained(model_id, {
   dtype: "fp32",
   device: "webgpu",
+  progress_callback,
 });
 
 const device = "webgpu";
@@ -47,6 +55,7 @@ const silero_vad = await AutoModel.from_pretrained(
   {
     config: { model_type: "custom" },
     dtype: "fp32", // Full-precision
+    progress_callback,
   },
 ).catch((error) => {
   self.postMessage({ error });
@@ -69,6 +78,7 @@ const transcriber = await pipeline(
   {
     device,
     dtype: DEVICE_DTYPE_CONFIGS[device],
+    progress_callback,
   },
 ).catch((error) => {
   self.postMessage({ error });
@@ -78,16 +88,18 @@ const transcriber = await pipeline(
 await transcriber(new Float32Array(INPUT_SAMPLE_RATE)); // Compile shaders
 
 const llm_model_id = "HuggingFaceTB/SmolLM2-1.7B-Instruct";
-const tokenizer = await AutoTokenizer.from_pretrained(llm_model_id);
+const tokenizer = await AutoTokenizer.from_pretrained(llm_model_id, {
+  progress_callback,
+});
 const llm = await AutoModelForCausalLM.from_pretrained(llm_model_id, {
   dtype: "q4f16",
   device: "webgpu",
+  progress_callback,
 });
 
 const SYSTEM_MESSAGE = {
   role: "system",
-  content:
-    "You're a helpful and conversational voice assistant. Keep your responses short, clear, and casual.",
+  content: PERSONA.systemPrompt,
 };
 await llm.generate({ ...tokenizer("x"), max_new_tokens: 1 }); // Compile shaders
 
@@ -100,6 +112,17 @@ self.postMessage({
   message: "Ready!",
   voices: tts.voices,
 });
+
+// After loading, report every network request this worker makes.
+// During a conversation this should stay silent: that is the privacy proof.
+new PerformanceObserver((list) => {
+  const entries = list
+    .getEntries()
+    .map((e) => ({ url: e.name, bytes: e.transferSize ?? 0 }));
+  if (entries.length) {
+    self.postMessage({ type: "network", entries });
+  }
+}).observe({ entryTypes: ["resource"] });
 
 // Global audio buffer to store incoming audio
 const BUFFER = new Float32Array(MAX_BUFFER_DURATION * INPUT_SAMPLE_RATE);
@@ -143,8 +166,14 @@ async function vad(buffer) {
 const speechToSpeech = async (buffer, data) => {
   isPlaying = true;
 
+  // Per-stage latency for the UI: end of speech -> transcript -> first LLM token -> first audio
+  const t0 = performance.now();
+  let tFirstToken = null;
+  let tFirstAudio = null;
+
   // 1. Transcribe the audio from the user
   const text = await transcriber(buffer).then(({ text }) => text.trim());
+  const tStt = performance.now();
   if (["", "[BLANK_AUDIO]"].includes(text)) {
     // If the transcription is empty or a blank audio, we skip the rest of the processing
     return;
@@ -158,6 +187,17 @@ const speechToSpeech = async (buffer, data) => {
   });
   (async () => {
     for await (const { text, phonemes, audio } of stream) {
+      if (tFirstAudio === null) {
+        tFirstAudio = performance.now();
+        self.postMessage({
+          type: "timings",
+          timings: {
+            stt: Math.round(tStt - t0),
+            firstToken: tFirstToken ? Math.round(tFirstToken - tStt) : null,
+            firstAudio: Math.round(tFirstAudio - t0),
+          },
+        });
+      }
       self.postMessage({ type: "output", text, result: audio });
     }
   })();
@@ -171,6 +211,7 @@ const speechToSpeech = async (buffer, data) => {
     skip_prompt: true,
     skip_special_tokens: true,
     callback_function: (text) => {
+      tFirstToken ??= performance.now();
       splitter.push(text);
     },
     token_callback_function: () => {},
@@ -182,7 +223,7 @@ const speechToSpeech = async (buffer, data) => {
     past_key_values: past_key_values_cache,
 
     do_sample: false, // TODO: do_sample: true is bugged (invalid data location on topk sample)
-    max_new_tokens: 1024,
+    max_new_tokens: PERSONA.maxNewTokens,
     streamer,
     stopping_criteria,
     return_dict_in_generate: true,
@@ -253,8 +294,7 @@ self.onmessage = async (event) => {
 
   switch (type) {
     case "start_call": {
-      const name = tts.voices[voice ?? "af_heart"]?.name ?? "Heart";
-      greet(`Hey there, my name is ${name}! How can I help you today?`);
+      greet(PERSONA.greeting);
       return;
     }
     case "end_call":

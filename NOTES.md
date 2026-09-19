@@ -32,6 +32,13 @@ In the Claude browser pane, the two large files (Kokoro 325 MB, SmolLM2 1.1 GB) 
 
 Small files (~298 MB incl. Whisper) cached fine. If this also happens in real Chrome, "repeat visits load from cache" is only partly true and the loading screen must not claim otherwise. TODO: reload test in real Chrome and record which files re-download.
 
+## Verified in the Claude browser pane (2026-09-19)
+
+- Loading screen shows per-model progress bars with real MB counts (Kokoro, whisper encoder/decoder, SmolLM2), plus a "first visit is ~1.7 GB" warning and total-so-far.
+- Ready state shows "models ready in X s" (measured, no cache claim), privacy panel at "0 requests", latency panel placeholder.
+- Error path works: mic permission denied renders the error in the red circle.
+- Mic capture is blocked in the pane, so the actual conversation test (greeting, replies, timings, echo behavior) must run in real Chrome.
+
 ## Baseline latency (step 2) - PENDING
 
 To measure per machine (Mac M2 8 GB, PC RTX 3050 Ti):
